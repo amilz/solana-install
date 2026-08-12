@@ -1,0 +1,44 @@
+name: Bump pinned versions
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for newer upstream versions
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          summary="$(mktemp)"
+          SUMMARY_FILE="$summary" ./scripts/check-versions.sh
+          {
+            echo "summary<<EOF"
+            cat "$summary"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/bump-pinned-versions
+          delete-branch: true
+          commit-message: "chore: bump pinned tool versions"
+          title: "chore: bump pinned tool versions"
+          body: |
+            Automated bump of the tool versions pinned in `install.sh`.
+
+            ${{ steps.check.outputs.summary }}
+
+            The `Installed Versions:` sample block in `README.md` is updated to match.
+          labels: dependencies

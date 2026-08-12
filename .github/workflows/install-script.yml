@@ -1,0 +1,248 @@
+name: Install Script
+
+on:
+  schedule:
+    # Mondays, 06:17 UTC
+    - cron: "17 6 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - scripts/**
+      - .github/workflows/install-script.yml
+  pull_request:
+    paths:
+      - install.sh
+      - scripts/**
+      - .github/workflows/install-script.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint shell scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          bash -n install.sh
+          bash -n scripts/check-versions.sh
+
+      - name: ShellCheck
+        run: shellcheck --severity=error install.sh scripts/check-versions.sh
+
+  install:
+    name: Install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # install.sh branches on `uname` (Linux/Darwin) and writes shell
+          # startup files based on $SHELL, so each platform is exercised with
+          # the shell its users actually run.
+          - os: ubuntu-latest
+            user_shell: /bin/bash
+            verify_shell: bash
+            verify_flags: -lic
+            clean_path: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          - os: macos-latest
+            user_shell: /bin/zsh
+            verify_shell: zsh
+            verify_flags: -ic
+            clean_path: /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned versions from install.sh
+        run: |
+          set -euo pipefail
+          # An unreadable pin must abort here: an empty expectation would make
+          # the version assertions in the verification step vacuous.
+          extract() {
+            local value
+            value=$(grep -oE "^[[:space:]]*local $1=\"[^\"]+\"" install.sh | head -1 | cut -d'"' -f2)
+            if [ -z "$value" ]; then
+              echo "Could not read $1 from install.sh" >&2
+              exit 1
+            fi
+            printf '%s' "$value"
+          }
+          # Assigned one at a time so `set -e` sees the failing substitution.
+          anchor=$(extract ANCHOR_VERSION)
+          surfpool=$(extract SURFPOOL_VERSION)
+          node=$(extract node_version)
+          {
+            echo "EXPECT_ANCHOR=$anchor"
+            echo "EXPECT_SURFPOOL=$surfpool"
+            echo "EXPECT_NODE=$node"
+          } | tee -a "$GITHUB_ENV"
+
+      - name: Remove pre-installed toolchains
+        run: |
+          set -euo pipefail
+          # GitHub runners ship rustup, node and yarn. Remove them so the
+          # script's fresh-install path is what gets tested.
+          command -v rustup >/dev/null 2>&1 && rustup self uninstall -y || true
+          rm -rf "$HOME/.cargo" "$HOME/.rustup" "$HOME/.avm" "$HOME/.nvm" \
+                 "$HOME/.local/share/solana" "$HOME/.local/bin/surfpool"
+          rm -f "$HOME/.bash_profile" "$HOME/.zshrc" "$HOME/.zprofile"
+          # install_nvm_and_node and install_yarn skip their work whenever
+          # `command -v` already finds node or yarn, so a runner-provided copy
+          # sitting on the clean PATH would reduce the whole install to a no-op
+          # while the verification below still reported success.
+          for dir in /usr/local/bin /opt/homebrew/bin; do
+            for bin in node npm npx yarn yarnpkg corepack; do
+              sudo rm -f "$dir/$bin" || true
+            done
+          done
+
+      - name: Run install.sh
+        timeout-minutes: 100
+        env:
+          SHELL: ${{ matrix.user_shell }}
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          # A minimal PATH stands in for a clean machine: no hosted toolcache
+          # node/yarn/cargo leaking into the run.
+          export PATH="${{ matrix.clean_path }}:$HOME/.local/bin"
+          bash ./install.sh
+
+      - name: Show shell startup files
+        if: always()
+        run: |
+          for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv"; do
+            echo "=== $f ==="
+            [ -f "$f" ] && cat "$f" || echo "(absent)"
+          done
+
+      - name: Verify toolchain in a fresh shell
+        env:
+          SHELL: ${{ matrix.user_shell }}
+        run: |
+          set -euo pipefail
+          # This step is a new process that inherits nothing from the install
+          # step, so the tools must come from the startup files install.sh and
+          # its sub-installers wrote.
+          cat > "$RUNNER_TEMP/verify.sh" <<'VERIFY'
+          fail=0
+
+          version_of() {
+            "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+          }
+
+          # Every tool install.sh manages lands somewhere under $HOME, so a
+          # resolved path outside it means a pre-existing system copy answered
+          # the check instead of the one the script was supposed to install.
+          require() {
+            resolved=$(command -v "$1" 2>/dev/null || true)
+            case "$resolved" in
+              "")
+                printf 'FAIL  %s is not on PATH\n' "$1"
+                fail=1
+                ;;
+              "$HOME"/*)
+                printf 'ok    %-9s %s\n' "$1" "$resolved"
+                ;;
+              *)
+                printf 'FAIL  %s resolves to %s, which is outside %s\n' "$1" "$resolved" "$HOME"
+                fail=1
+                ;;
+            esac
+          }
+
+          require_version() {
+            if [ -z "$2" ]; then
+              printf 'FAIL  no expected version supplied for %s\n' "$1"
+              fail=1
+              return
+            fi
+            got=$(version_of "$1")
+            if [ "$got" = "$2" ]; then
+              printf 'ok    %-9s pinned at %s\n' "$1" "$2"
+            else
+              printf 'FAIL  %s is %s, install.sh pins %s\n' "$1" "${got:-none}" "$2"
+              fail=1
+            fi
+          }
+
+          for cmd in rustc cargo solana anchor avm node npm yarn surfpool; do
+            require "$cmd"
+          done
+
+          require_version anchor "$EXPECT_ANCHOR"
+          require_version surfpool "$EXPECT_SURFPOOL"
+          require_version node "$EXPECT_NODE"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "Toolchain verification failed."
+            exit 1
+          fi
+          echo "Toolchain verification passed."
+          VERIFY
+          ${{ matrix.verify_shell }} ${{ matrix.verify_flags }} "source '$RUNNER_TEMP/verify.sh'"
+
+      - name: Re-run install.sh (idempotency)
+        timeout-minutes: 60
+        env:
+          SHELL: ${{ matrix.user_shell }}
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          export PATH="${{ matrix.clean_path }}:$HOME/.local/bin"
+          bash ./install.sh
+
+      - name: Re-verify toolchain in a fresh shell
+        env:
+          SHELL: ${{ matrix.user_shell }}
+        run: |
+          set -euo pipefail
+          ${{ matrix.verify_shell }} ${{ matrix.verify_flags }} "source '$RUNNER_TEMP/verify.sh'"
+
+  hosted:
+    name: Hosted script (workers.dev)
+    # Scheduled/manual only: the worker serves whatever is on main, so this
+    # says nothing about a pull request's changes, and an outage on
+    # Cloudflare's side should not block merges.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch hosted script
+        run: |
+          set -euo pipefail
+          status=$(curl --proto '=https' --tlsv1.2 -sS -o hosted.sh -w '%{http_code}' \
+            https://solana-install.solana.workers.dev)
+          echo "HTTP $status"
+          if [ "$status" != "200" ]; then
+            echo "Hosted installer returned HTTP $status"
+            head -c 500 hosted.sh || true
+            exit 1
+          fi
+
+      - name: Fetch script from main
+        run: |
+          set -euo pipefail
+          curl -sSfL -o upstream.sh \
+            https://raw.githubusercontent.com/solana-developers/solana-install/main/install.sh
+
+      - name: Compare hosted script with main
+        run: |
+          set -euo pipefail
+          head -1 hosted.sh | grep -qx '#!/usr/bin/env bash'
+          diff -u upstream.sh hosted.sh
+          bash -n hosted.sh
+
+      - name: Check stats endpoint
+        run: curl -sSf https://solana-install.solana.workers.dev/stats

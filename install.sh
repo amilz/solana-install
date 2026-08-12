@@ -245,7 +245,7 @@ install_nvm_and_node() {
         log_info "NVM is already installed."
     else
         log_info "Installing NVM..."
-        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.6/install.sh | bash
     fi
 
     export NVM_DIR="$HOME/.nvm"
@@ -261,7 +261,7 @@ install_nvm_and_node() {
     fi
 
     # Install specific Node.js version
-    local node_version="24.10.0"
+    local node_version="24.19.0"
     local target_node="v${node_version}"
 
     if command -v node >/dev/null 2>&1; then
@@ -310,7 +310,7 @@ install_yarn() {
 # Install Surfpool
 ########################################
 install_surfpool() {
-    local SURFPOOL_VERSION="1.4.0"
+    local SURFPOOL_VERSION="1.5.0"
     local target_version="${SURFPOOL_VERSION#v}"
 
     local current_version=""
