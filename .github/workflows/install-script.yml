@@ -43,7 +43,9 @@ jobs:
   install:
     name: Install (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    # Must exceed the sum of the two install step budgets below, or the
+    # idempotency re-run is cancelled by the job cap instead of timing out.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +61,7 @@ jobs:
           - os: macos-latest
             user_shell: /bin/zsh
             verify_shell: zsh
-            verify_flags: -ic
+            verify_flags: -lic
             clean_path: /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
     steps:
       - uses: actions/checkout@v4
@@ -237,12 +239,23 @@ jobs:
           curl -sSfL -o upstream.sh \
             https://raw.githubusercontent.com/solana-developers/solana-install/main/install.sh
 
-      - name: Compare hosted script with main
+      - name: Check hosted script is a usable installer
         run: |
           set -euo pipefail
           head -1 hosted.sh | grep -qx '#!/usr/bin/env bash'
-          diff -u upstream.sh hosted.sh
+          grep -q '^main()' hosted.sh
           bash -n hosted.sh
+
+      - name: Report drift from main
+        run: |
+          # The worker caches the script for an hour (cacheTtl in
+          # cloudflare/src/index.ts), so lagging behind main is expected for a
+          # while after a merge and is reported rather than failed.
+          if diff -u upstream.sh hosted.sh; then
+            echo "Hosted script matches main."
+          else
+            echo "Hosted script differs from main; expected for up to an hour after a merge."
+          fi
 
       - name: Check stats endpoint
         run: curl -sSf https://solana-install.solana.workers.dev/stats

@@ -91,13 +91,17 @@ github_api() {
 # any tag carrying a prerelease suffix (rc, beta, ...) are ignored, and the
 # result is chosen by semantic version rather than by publication date or by the
 # repository's "latest release" marker.
+# A failed request or a grep that matches nothing must yield an empty string so
+# that bump_pin can report which tool could not be resolved. Without the
+# `|| true`, `set -o pipefail` would abort the whole run at the caller's
+# assignment, before any tool is checked and before the README is synced.
 latest_github_version() {
     local repo="$1"
     github_api "https://api.github.com/repos/${repo}/releases?per_page=100" \
         | jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
         | sed 's/^v//' \
         | grep -E '^[0-9]+(\.[0-9]+)*$' \
-        | max_version
+        | max_version || true
 }
 
 # Highest Node.js version carrying an LTS codename.
@@ -105,13 +109,13 @@ latest_node_lts_version() {
     curl --proto '=https' --tlsv1.2 -sSfL https://nodejs.org/dist/index.json \
         | jq -r '.[] | select(.lts) | .version' \
         | sed 's/^v//' \
-        | max_version
+        | max_version || true
 }
 
 ########################################
 # Pin rewriting
 ########################################
-# Replaces the first sed-matched pin in a file, in place.
+# Applies a sed expression to a file in place, rewriting every matching line.
 replace_in_file() {
     local file="$1" expression="$2" tmp
     tmp="$(mktemp)"
@@ -182,7 +186,7 @@ nvm_current="$(read_pin "$INSTALL_SH" 's|.*nvm-sh/nvm/v\([0-9][0-9.]*\)/install\
 
 log_info "Resolving upstream versions..."
 anchor_latest="$(latest_github_version "solana-foundation/anchor")"
-surfpool_latest="$(latest_github_version "txtx/surfpool")"
+surfpool_latest="$(latest_github_version "solana-foundation/surfpool")"
 nvm_latest="$(latest_github_version "nvm-sh/nvm")"
 node_latest="$(latest_node_lts_version)"
 
@@ -206,9 +210,19 @@ if [[ -f "$README" ]]; then
     surfpool_pinned="$(read_pin "$INSTALL_SH" 's/^[[:space:]]*local SURFPOOL_VERSION="\([^"]*\)".*/\1/p')"
     node_pinned="$(read_pin "$INSTALL_SH" 's/^[[:space:]]*local node_version="\([^"]*\)".*/\1/p')"
 
+    # Each substitution is a silent no-op if the block is ever reworded, which
+    # would let the README drift from install.sh unnoticed, so require the
+    # lines to be there first.
+    for prefix in "Anchor CLI: anchor-cli " "Surfpool CLI: surfpool " "Node.js: v"; do
+        if ! grep -qF -- "$prefix" "$README"; then
+            log_error "Could not find a \"${prefix}\" line in $README."
+            exit 1
+        fi
+    done
+
     replace_in_file "$README" "s/^\(Anchor CLI: anchor-cli \).*/\1${anchor_pinned}/"
     replace_in_file "$README" "s/^\(Surfpool CLI: surfpool \).*/\1${surfpool_pinned}/"
-    replace_in_file "$README" "s/^\(Node.js: v\).*/\1${node_pinned}/"
+    replace_in_file "$README" "s/^\(Node\.js: v\).*/\1${node_pinned}/"
 fi
 
 if ((BUMPED == 0)); then

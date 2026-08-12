@@ -345,10 +345,14 @@ install_surfpool() {
         return 1
     fi
 
+    # The installer resolves its download URL from $VERSION, defaulting to the
+    # newest release. Passing the pinned tag is what makes SURFPOOL_VERSION the
+    # version that actually gets installed rather than only the version the
+    # check below asserts.
     (
         set -e
         cd "$installer_tmp_dir"
-        curl -sL https://run.surfpool.run/ | bash
+        curl -sL https://run.surfpool.run/ | VERSION="v${target_version}" bash
     )
     local install_status=$?
 
